@@ -7,6 +7,7 @@ use app\components\proto\classes\Box;
 use app\components\proto\classes\Counteragent;
 use app\components\proto\classes\CounteragentList;
 use app\components\proto\classes\Document;
+use app\components\proto\classes\DocumentList;
 use app\components\proto\classes\DraftToSend;
 use app\components\proto\classes\Message;
 use app\components\proto\classes\MessageToPost;
@@ -37,9 +38,9 @@ class Diadoc extends Component
      * Создание классов из прото файлов
      * php ./vendor/protobuf-php/protobuf-plugin/bin/protobuf --include-descriptors -i . -o ./components/proto/classes/ ./components/proto/TemplateToPost.proto
      */
-    public $error;
-    public $errorCode;
-    public $response;
+    static $error;
+    static $errorCode;
+    static $response;
     public $token;
     static $params = [];
     static $settings;
@@ -111,15 +112,23 @@ class Diadoc extends Component
                 'password' => $settings->password,
             ]),
         ];
-        $this->response = $this->curlRequest();
-        return $this->response;
+        self::$response = $this->curlRequest();
+        return self::$response;
     }
 
+    /**
+     * Проверка валидности токена
+     * @return bool
+     */
     public static function hasValidToken()
     {
         return (self::$settings && self::$settings->token && strlen(self::$settings->token) == 172);
     }
 
+    /**
+     * Проверка авторизации в системе Диадок на примере получения моих организаций
+     * @return bool
+     */
     public static function auth()
     {
         $result = false;
@@ -137,7 +146,7 @@ class Diadoc extends Component
             self::$params['httpHeader'] = [
                 "Authorization: DiadocAuth ddauth_api_client_id=" . self::$settings->diadoc_client_id . ", ddauth_token=" . self::$settings->token,
             ];
-            $response = self::curlRequest2();
+            $response = self::curlRequest();
 
             try {
                 $organizations = OrganizationList::fromStream($response);
@@ -147,13 +156,17 @@ class Diadoc extends Component
         return $result;
     }
 
-
+    /**
+     * Получение токена
+     * @return bool
+     * @throws \yii\console\Exception
+     */
     public function setToken()
     {
-        if(!$this->response || strlen($this->response) != 172) {
+        if(!self::$response || strlen(self::$response) != 172) {
             throw new \yii\console\Exception('Не удается получить авторизационный token от системы Диадок', '504');
         }
-        self::$settings->token = $this->response;
+        self::$settings->token = self::$response;
         self::$settings->save(false);
         self::$params['httpHeader'] = [
             "Authorization: DiadocAuth ddauth_api_client_id=" . self::$settings->diadoc_client_id . ", ddauth_token=" . self::$settings->token,
@@ -161,13 +174,18 @@ class Diadoc extends Component
         return true;
     }
 
-    /** Получение токена */
+    /** Получение токена
+     * @return mixed|null
+     */
     public function getToken()
     {
         return self::$settings->token;
     }
 
-    /** Связан ли контрагент с моей организацией */
+    /** Связан ли контрагент с моей организацией
+     * @param $counterAgentInn
+     * @return bool
+     */
     public function checkRelationshipOrganizations($counterAgentInn)
     {
         $organizationDiaDocId = self::getMyOrganizationsV2()->getOrganizationsList()[0]->getOrgId();
@@ -197,11 +215,17 @@ class Diadoc extends Component
         }
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl($urlParams);
         self::$params['requestType'] = 'GET';
-        $this->response = $this->curlRequest();
+        self::$response = $this->curlRequest();
         $parser = new XmlParser();
-        return $parser->parse($this->response, 'Content-Type: application/xml');
+        return $parser->parse(self::$response, 'Content-Type: application/xml');
     }
 
+    /**
+     * https://api-docs.diadoc.ru/ru/latest/http/GetCounteragents.html?#v3
+     * @param string|null $myOrgId
+     * @param string|null $counteragentStatus
+     * @return CounteragentList|\Protobuf\Message
+     */
     public function getCounterAgentsV2(string $myOrgId = null, string $counteragentStatus = null)
     {
         if ($myOrgId == null) {
@@ -216,8 +240,8 @@ class Diadoc extends Component
         }
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl($urlParams);
         self::$params['requestType'] = 'GET';
-        $this->response = $this->curlRequest();
-        return CounteragentList::fromStream($this->response);
+        self::$response = $this->curlRequest();
+        return CounteragentList::fromStream(self::$response);
     }
 
     /** Найти контрагента по параметру */
@@ -237,6 +261,12 @@ class Diadoc extends Component
         return null;
     }
 
+    /**
+     * https://api-docs.diadoc.ru/ru/latest/http/GetMessage.html
+     * @param $boxId
+     * @param $messageId
+     * @return Message|\Protobuf\Message
+     */
     public function getMessage($boxId, $messageId)
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
@@ -245,13 +275,20 @@ class Diadoc extends Component
             'messageId' => $messageId,
         ]);
         self::$params['requestType'] = 'GET';
-        $this->response = $this->curlRequest();
-        if($this->errorCode != 200){
-            return $this->error;
+        self::$response = $this->curlRequest();
+        if(self::$errorCode != 200){
+            return self::$error;
         }
-        return Message::fromStream($this->response);
+        return Message::fromStream(self::$response);
     }
 
+    /**
+     * https://api-docs.diadoc.ru/ru/latest/http/GetDocument.html
+     * @param $boxId
+     * @param $messageId
+     * @param $entityId
+     * @return Document|\Protobuf\Message
+     */
     public function getDocument($boxId, $messageId, $entityId)
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
@@ -261,16 +298,32 @@ class Diadoc extends Component
             'entityId' => $entityId,
         ]);
         self::$params['requestType'] = 'GET';
-        $this->response = $this->curlRequest();
-        if($this->errorCode != 200){
-            return $this->error;
+        self::$response = $this->curlRequest();
+        if(self::$errorCode != 200){
+            return self::$error;
         }
-        return Document::fromStream($this->response);
+        return Document::fromStream(self::$response);
+    }
+
+    public function getOutboundDocuments($boxId)
+    {
+        self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
+            '/V3/GetDocuments',
+            'boxId' => $boxId,
+            'filterCategory' => 'Any.OutboundWithRecipientSignature', // все исходящие, подписанные контрагентом
+        ]);
+        self::$params['requestType'] = 'GET';
+        self::$params['requestClass'] = DocumentList::class;
+        self::$response = $this->curlRequest();
+        if(self::$errorCode != 200){
+            return self::$error;
+        }
+        return self::$response;
     }
 
     /**
      * Список организаций
-     * Docs http://api-docs.diadoc.ru/ru/latest/http/GetMyOrganizations.html
+     * https://api-docs.diadoc.ru/ru/latest/http/GetMyOrganizations.html
      */
     public function getMyOrganizations()
     {
@@ -280,10 +333,14 @@ class Diadoc extends Component
             'autoRegister' => 'false'
         ]);
         self::$params['requestType'] = 'GET';
-        $this->response = $this->curlRequest();
+        self::$response = $this->curlRequest();
         return $this->response();
     }
 
+    /**
+     * https://api-docs.diadoc.ru/ru/latest/http/GetMyOrganizations.html
+     * @return OrganizationList|\Protobuf\Message
+     */
     public function getMyOrganizationsV2()
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
@@ -291,8 +348,8 @@ class Diadoc extends Component
             'autoRegister' => 'false'
         ]);
         self::$params['requestType'] = 'GET';
-        $this->response = $this->curlRequest();
-        return OrganizationList::fromStream($this->response);
+        self::$response = $this->curlRequest();
+        return OrganizationList::fromStream(self::$response);
     }
 
     public function getHeadOrganization()
@@ -309,6 +366,12 @@ class Diadoc extends Component
         throw new Exception('Head organization not found');
     }
 
+    /**
+     * https://api-docs.diadoc.ru/ru/latest/http/GetCounteragent.html?#v2
+     * @param $myOrgId
+     * @param $counteragentOrgId
+     * @return Counteragent|\Protobuf\Message
+     */
     public function getCounteragent($myOrgId, $counteragentOrgId)
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
@@ -317,10 +380,15 @@ class Diadoc extends Component
             'counteragentOrgId' => $counteragentOrgId,
         ]);
         self::$params['requestType'] = 'GET';
-        $this->response = $this->curlRequest();
-        return Counteragent::fromStream($this->response);
+        self::$response = $this->curlRequest();
+        return Counteragent::fromStream(self::$response);
     }
 
+    /**
+     * https://api-docs.diadoc.ru/ru/latest/http/PostTemplate.html
+     * @param array $params
+     * @return mixed|\SimpleXMLElement
+     */
     public function postTemplate($params = [])
     {
         $templateToPost = TemplateToPost::fromArray($params);
@@ -333,14 +401,14 @@ class Diadoc extends Component
         self::$params['requestType'] = 'POST';
         self::$params['postFields'] = $protoData;
 
-        $this->response = $this->curlRequest();
+        self::$response = $this->curlRequest();
         return $this->response();
     }
 
     /**
+     * https://api-docs.diadoc.ru/ru/latest/http/PostMessage.html
      * @param array $params
      * @return \SimpleXMLElement
-     * https://api-docs.diadoc.ru/ru/latest/http/PostMessage.html
      */
     public function postMessage($params = [])
     {
@@ -355,14 +423,18 @@ class Diadoc extends Component
         self::$params['postFields'] = $protoData;
         self::$params['curlRequestDump'] = 0;
 
-        $this->response = $this->curlRequest();
+        self::$response = $this->curlRequest();
 
         /** @phpstan-ignore-next-line */
-        return Message::fromStream($this->response)->getMessageId();
+        return Message::fromStream(self::$response)->getMessageId();
     }
 
     /**
-     * Delete documents, messages, drafts
+     * Метод позволяет помечать документы как удаленные.
+     * Если параметр documentId не задан, то сообщение messageId удаляется целиком,
+     * и все документы в нем автоматически помечаются как удаленные.
+     * Когда из сообщения удаляется последний документ,
+     * само сообщение (структуры Message, Template) также помечается как удаленное
      * https://api-docs.diadoc.ru/ru/latest/http/Delete.html
      * Для вызова этого метода текущий пользователь должен иметь доступ ко всем удаляемым документам, в противном случае возвращается код ошибки 403 (Forbidden).
      */
@@ -377,12 +449,13 @@ class Diadoc extends Component
         self::$params['postFields'] = Json::encode([]);
         self::$params['curlRequestDump'] = 0;
 
-        $this->response = $this->curlRequest();
-        return $this->response;
+        self::$response = $this->curlRequest();
+        return self::$response;
     }
 
     /**
      * Отправка файла на "полку"
+     * https://api-docs.diadoc.ru/ru/latest/http/ShelfUpload.html
      * @param string $nameOnShelf
      * @param string $filePath
      * @return false|string
@@ -390,7 +463,7 @@ class Diadoc extends Component
     public function shelfUpload($nameOnShelf = 'trolo_name', $filePath = '/var/www/http/web/uploads/protected/KSPrintForms/KS2PrintForm_394.pdf') {
 
 
-        $url = $this->baseUrl . "/ShelfUpload?nameOnShelf=__userId__/$nameOnShelf&partIndex=0&isLastPart=1";
+        $url = self::$baseUrl . "/ShelfUpload?nameOnShelf=__userId__/$nameOnShelf&partIndex=0&isLastPart=1";
 
         $data = file_get_contents($filePath);
 
@@ -413,8 +486,9 @@ class Diadoc extends Component
     }
 
     /**
-     * @return proto\classes\DocumentTypeDescription|\SimpleXMLElement
+     * Метод возвращает описание типов документов, доступных в ящике
      * https://api-docs.diadoc.ru/ru/latest/http/GetDocumentTypes.html
+     * @return proto\classes\DocumentTypeDescription|\SimpleXMLElement
      */
     public function getDocumentTypes()
     {
@@ -425,12 +499,17 @@ class Diadoc extends Component
             #'autoRegister' => 'false'
         ]);
         self::$params['requestType'] = 'GET';
-        $this->response = $this->curlRequest();
+        self::$response = $this->curlRequest();
         // todo доделать вывод данных
-        return $documentTypeDescription = \app\components\proto\classes\DocumentTypeDescription::fromStream($this->response);
+        return $documentTypeDescription = \app\components\proto\classes\DocumentTypeDescription::fromStream(self::$response);
         return $this->response();
     }
 
+    /**
+     * https://api-docs.diadoc.ru/ru/latest/http/SendDraft.html
+     * @param array $params
+     * @return DraftToSend|false|\Protobuf\Message
+     */
     public function sendDraft($params = [])
     {
         $draftToSend = DraftToSend::fromArray($params);
@@ -443,13 +522,18 @@ class Diadoc extends Component
         self::$params['requestType'] = 'POST';
         self::$params['postFields'] = $protoData;
 
-        $this->response = $this->curlRequest();
-        if($this->errorCode != 200) {
+        self::$response = $this->curlRequest();
+        if(self::$errorCode != 200) {
             return false;
         }
-        return DraftToSend::fromStream($this->response);
+        return DraftToSend::fromStream(self::$response);
     }
 
+    /**
+     * https://api-docs.diadoc.ru/ru/latest/http/GetBox.html
+     * @param $boxId
+     * @return Box|\Protobuf\Message
+     */
     public function getBox($boxId)
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
@@ -457,11 +541,17 @@ class Diadoc extends Component
             'boxId' => $boxId,
         ]);
         self::$params['requestType'] = 'GET';
-        $this->response = $this->curlRequest();
+        self::$response = $this->curlRequest();
         // Возвращает данные другим способом. Вероятно так будет правильнее!!!
-        return Box::fromStream($this->response);
+        return Box::fromStream(self::$response);
     }
 
+    /**
+     * https://api-docs.diadoc.ru/ru/latest/http/GetOrganization.html
+     * @param $key
+     * @param $value
+     * @return Organization|\Protobuf\Message
+     */
     public function getOrganization($key, $value)
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
@@ -469,9 +559,10 @@ class Diadoc extends Component
             $key => $value,
         ]);
         self::$params['requestType'] = 'GET';
-        $this->response = $this->curlRequest();
+        self::$params['requestClass'] = Organization::class;
+        self::$response = $this->curlRequest();
         // Возвращает данные другим способом. Вероятно так будет правильнее!!!
-        return Organization::fromStream($this->response);
+        return self::$response;
     }
 
     /** Найти организацию по параметру */
@@ -495,11 +586,11 @@ class Diadoc extends Component
     private function response()
     {
         $parser = new XmlParser();
-        return new \SimpleXMLElement($this->response);
-        if(is_string($this->response)) {
-            die($this->response);
+        return new \SimpleXMLElement(self::$response);
+        if(is_string(self::$response)) {
+            die(self::$response);
         }
-        return $parser->parse($this->response, 'Content-Type: application/xml');
+        return $parser->parse(self::$response, 'Content-Type: application/xml');
     }
 
 
@@ -510,17 +601,17 @@ class Diadoc extends Component
 
     private function isError()
     {
-        return ($this->error)?true:false;
+        return (self::$error)?true:false;
     }
 
     private function isResponse()
     {
-        return ($this->response)?true:false;
+        return (self::$response)?true:false;
     }
 
 
     /** Выполнение cURL */
-    private function curlRequest()
+    private static function curlRequest()
     {
         $curl = curl_init();
         $params = [
@@ -543,11 +634,11 @@ class Diadoc extends Component
         if($response) {
             $json = json_decode($response);
             $curlInfo = curl_getinfo($curl);
-            $this->errorCode = $curlInfo['http_code'];
+            self::$errorCode = $curlInfo['http_code'];
             if ($curlInfo['http_code'] == 200 && $json->suggestions) {
-                $this->response = $json->suggestions[0];
+                self::$response = $json->suggestions[0];
             } elseif ($curlInfo['http_code'] != 200) {
-                $this->error = $response;
+                self::$error = $response;
                 // Сохранение в логи не корретных ответов сервиса
                 $diaDocLog = new ChangeLog();
                 $diaDocLog->user_id = \Yii::$app->user->id;
@@ -565,35 +656,11 @@ class Diadoc extends Component
         }
         curl_close($curl);
         unset(self::$params['postFields']);
+        if(isset(self::$params['requestClass'])) {
+            $response = self::$params['requestClass']::fromStream($response);
+            unset(self::$params['requestClass']);
+        }
         return $response;
     }
 
-    private static function curlRequest2()
-    {
-        $curl = curl_init();
-        $params = self::$params;
-        $params = [
-            CURLOPT_URL => $params['url'],
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_ENCODING => "",
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_TIMEOUT => 0,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-            CURLOPT_CUSTOMREQUEST => $params['requestType'],
-            CURLOPT_HTTPHEADER => $params['httpHeader'],
-            // CURLOPT_FAILONERROR => true,
-        ];
-        if (isset($params['postFields']) && $params['postFields']) {
-            $params[CURLOPT_POSTFIELDS] = $params['postFields'];
-        }
-        curl_setopt_array($curl, $params);
-        $response = curl_exec($curl);
-        if(isset($params['curlRequestDump']) && $params['curlRequestDump']) {
-            echo $response;
-        }
-        curl_close($curl);
-        unset(self::$params['postFields']);
-        return $response;
-    }
 }
