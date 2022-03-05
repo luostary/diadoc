@@ -339,9 +339,9 @@ class Diadoc extends Component
             // Подписант (Заказчик)
             'customerInn' => $contract->customer->inn,
             'customerType' => 1,
-            'customerLastName' => 'Шамшин',
-            'customerFirstName' => 'Владимир',
-            'customerMiddleName' => 'Владимирович',
+            'customerLastName' => '',
+            'customerFirstName' => '',
+            'customerMiddleName' => '',
             'customerBoxId' => $boxId,
         ];
         foreach ($actKs3->actsKs2 as $item) {
