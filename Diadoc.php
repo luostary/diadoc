@@ -8,18 +8,29 @@ use app\components\proto\classes\Counteragent;
 use app\components\proto\classes\CounteragentList;
 use app\components\proto\classes\Document;
 use app\components\proto\classes\DocumentList;
+use app\components\proto\classes\DocumentTypesResponseV2;
 use app\components\proto\classes\DraftToSend;
 use app\components\proto\classes\Message;
 use app\components\proto\classes\MessageToPost;
 use app\components\proto\classes\Organization;
 use app\components\proto\classes\OrganizationList;
+use app\components\proto\classes\Template;
 use app\components\proto\classes\TemplateToPost;
+use app\models\base\Act;
+use app\models\base\ActKs3;
 use app\models\base\ChangeLog;
 use app\models\DiadocSetting;
+use app\modules\contract\modules\prints\controllers\A000Controller;
+use app\modules\contract\modules\prints\controllers\A001Controller;
+use app\modules\contract\modules\prints\controllers\A002Controller;
+use app\modules\contract\modules\prints\PrintModule;
+use app\modules\system\modules\user\models\User;
 use yii\base\Component;
 use yii\helpers\HtmlPurifier;
 use yii\helpers\Json;
 use yii\httpclient\Exception;
+use yii\web\Application;
+use Yii;
 
 /**
  * Class Diadoc
@@ -48,6 +59,21 @@ class Diadoc extends Component
     static $externalUrlManager = null;
     const COMMON_ERROR = 'Диадок не подключен';
 
+    const RecipientResponseStatus_RecipientResponseStatusUnknown = 0;
+    const RecipientResponseStatus_RecipientResponseStatusNotAcceptable = 1;
+    const RecipientResponseStatus_WithRecipientSignature = 3;
+    const RecipientResponseStatus_RecipientSignatureRequestRejected = 4;
+
+    const DOC_FLOW_STATUS_CANCELED = 'Аннулирован';
+    const DOC_FLOW_STATUS_PARTNER_SIGNED = 'Подписан контрагентом';
+    const DOC_FLOW_STATUS_PENDING_CANCELLATION = 'Ожидается аннулирование';
+    const DOC_FLOW_STATUS_PARTNER_REJECTED = 'Контрагент отказал в подписи';
+    const DOC_FLOW_STATUS_DOCUMENT_WAITING_CREATE = 'Ожидается создание документа';
+    const DOC_FLOW_STATUS_DOCUMENT_NEED_CREATE = 'Требуется создать документ';
+    const DOC_FLOW_STATUS_DOCUMENT_PROCESSED = 'Обработан';
+    const DOC_FLOW_STATUS_DOCUMENT_NEED_SIGN = 'Требуется подписать и отправить';
+    const DOC_FLOW_STATUS_DOCUMENT_SIGNED = 'Подписан';
+    const DOC_FLOW_STATUS_DOCUMENT_DONE = 'Документооборот завершен';
 
     public function init()
     {
@@ -62,7 +88,6 @@ class Diadoc extends Component
             'baseUrl' => self::$baseUrl,
         ]);
         self::$settings = DiadocSetting::find()->where(['is_active' => 1])->one();
-        // $this->authorization();$this->setToken();return;
         if(self::$settings) {
             if (!self::hasValidToken() || !self::auth()) {
                 $this->authorization();
@@ -74,12 +99,15 @@ class Diadoc extends Component
     public static function find()
     {
         self::$settings = DiadocSetting::find()->where(['is_active' => 1])->one();
-        if(self::$settings) {
+        if (self::$settings) {
             return new self();
         }
     }
 
-
+    public static function check(): bool
+    {
+        return self::hasValidToken() && self::auth();
+    }
 
     /** Авторизация и сохранение полученного токена */
     public function authorization()
@@ -98,8 +126,7 @@ class Diadoc extends Component
 
         self::$params = [
             'url' => self::$externalUrlManager->createAbsoluteUrl([
-                //'url' => Url::to([
-                '/V3/Authenticate',
+                $settings->url_auth,
                 'type' => 'password',
             ]),
             'requestType' => 'POST',
@@ -183,13 +210,19 @@ class Diadoc extends Component
     }
 
     /** Связан ли контрагент с моей организацией
-     * @param $counterAgentInn
+     * @param integer $counterAgentInn
      * @return bool
      */
     public function checkRelationshipOrganizations($counterAgentInn)
     {
-        $organizationDiaDocId = self::getMyOrganizationsV2()->getOrganizationsList()[0]->getOrgId();
-        $partnerDiaDocId = self::getOrganization('inn', $counterAgentInn)->getOrgId();
+        /** @var OrganizationList $organizationList */
+        $organizationList = self::getMyOrganizationsV2();
+        $organizationDiaDocId = $organizationList->getOrganizationsList()[0]->getOrgId();
+
+        /** @var Organization $partnerDiaDoc */
+        $partnerDiaDoc = self::getOrganization('inn', $counterAgentInn);
+        $partnerDiaDocId = $partnerDiaDoc->getOrgId();
+        /** @var Counteragent $counterAgent */
         $counterAgent = self::getCounteragent($organizationDiaDocId, $partnerDiaDocId);
         return (
             $counterAgent->getCurrentStatus()->name() == 'IsMyCounteragent' &&
@@ -200,7 +233,7 @@ class Diadoc extends Component
      * Список контрагентов относящихся к организации
      * Docs http://api-docs.diadoc.ru/ru/latest/http/GetCounteragents.html
      */
-    public function getCounterAgents(string $myOrgId = null, string $counteragentStatus = null)
+    public function getCounterAgents(string $myOrgId = null, string $counteragentStatus = null, $afterIndexKey = 0)
     {
         if ($myOrgId == null) {
             die('Не указан ИД организации');
@@ -208,32 +241,37 @@ class Diadoc extends Component
         $urlParams = [
             '/V2/GetCounteragents',
             'myOrgId' => $myOrgId,
-            'outputFormat' => 'xml'
+            'afterIndexKey' => $afterIndexKey,
         ];
         if ($counteragentStatus) {
             $urlParams['counteragentStatus'] = $counteragentStatus;
         }
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl($urlParams);
         self::$params['requestType'] = 'GET';
+        self::$params['requestClass'] = CounteragentList::class;
         self::$response = $this->curlRequest();
-        $parser = new XmlParser();
-        return $parser->parse(self::$response, 'Content-Type: application/xml');
+        return self::$response;
     }
 
     /**
      * https://api-docs.diadoc.ru/ru/latest/http/GetCounteragents.html?#v3
      * @param string|null $myOrgId
      * @param string|null $counteragentStatus
+     *
      * @return CounteragentList|\Protobuf\Message
      */
-    public function getCounterAgentsV2(string $myOrgId = null, string $counteragentStatus = null)
-    {
+    public function getCounterAgentsV2(
+        string $myOrgId = null,
+        string $counteragentStatus = null,
+        int $afterIndexKey = 0
+    ) {
         if ($myOrgId == null) {
             die('Не указан ИД организации');
         }
         $urlParams = [
             '/V2/GetCounteragents',
             'myOrgId' => $myOrgId,
+            'afterIndexKey' => $afterIndexKey,
         ];
         if ($counteragentStatus) {
             $urlParams['counteragentStatus'] = $counteragentStatus;
@@ -242,6 +280,209 @@ class Diadoc extends Component
         self::$params['requestType'] = 'GET';
         self::$response = $this->curlRequest();
         return CounteragentList::fromStream(self::$response);
+    }
+
+    /**
+     * Формирование документа Счет-фактура
+     * @param string $boxId
+     * @param integer $ks3id
+     * @return bool|string|void
+     * @throws \yii\base\InvalidConfigException
+     */
+
+    public function generateUniversalTransferDocument($boxId, $ks3id)
+    {
+
+        self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
+            '/GenerateTitleXml',
+            'boxId' => $boxId,
+            'documentTypeNamedId' => 'UniversalTransferDocument',
+            'documentFunction' => 'СЧФДОП', // строковый идентификатор функции, уникальный в рамках типа документа
+            'documentVersion' => 'utd820_05_01_01', // _Hyphen', //  – строковый идентификатор версии, уникальный в рамках функции типа документа
+            'titleIndex' => 0,
+        ]);
+
+        $actKs3 = ActKs3::findOne($ks3id);
+        $contract = $actKs3->contract;
+
+        /** @var \app\models\base\Organization $partner */
+        $partner = $contract->partner;
+
+        $concatItemName = htmlentities($contract->object_description) .
+            ' по объекту ' . htmlentities($contract->project_text) .
+            ' по договору ' . $contract->number . ' от ' . Yii::$app->formatter->asDate($contract->dt_contract, Yii::$app->params['dateRu']) .
+            ' за период с ' . Yii::$app->formatter->asDate($actKs3->period_from, Yii::$app->params['dateRu']) . ' по ' . Yii::$app->formatter->asDate($actKs3->period_to, Yii::$app->params['dateRu']);
+
+        $params = [
+            'DocumentDate' => date('d.m.Y'),
+            'DocumentCreatorBase' => $contract->customer->main_accountant,
+            'DocumentCreator' => $contract->customer->main_accountant,
+            'DocumentNumber' => '№ ' . $actKs3->number . ' по договору ' . $contract->number,
+            'Function' => 'СЧФДОП',
+
+            // Продавец (Исполнитель)
+            'executorInn' => $partner->inn,
+            'executorFnsParticipantId' => $partner->diadocPartner->fns_participant_id,
+            'executorOrgName' => 1,
+            'executorType' => $partner->type_id,
+
+            // Товар
+            'Product' => $concatItemName,
+            'Unit' => null,
+            'TaxRate' => (($partner->payer_nds) ? Yii::$app->params['NDS'] . '%' : 'без НДС'),
+            'Quantity' => 1,
+            'Price' => 0,
+            'Vat' => 0,
+            'Subtotal' => 0,
+            'SubtotalWithVatExcluded' => 0,
+
+            // Подписант (Заказчик)
+            'customerInn' => $contract->customer->inn,
+            'customerType' => 1,
+            'customerLastName' => 'Шамшин',
+            'customerFirstName' => 'Владимир',
+            'customerMiddleName' => 'Владимирович',
+            'customerBoxId' => $boxId,
+        ];
+        foreach ($actKs3->actsKs2 as $item) {
+            /** @var Act $item */
+            if ($item->act_ks3_id == $actKs3->id) {
+                $params['Price'] += $item->summ;
+            }
+        }
+
+        $params['Subtotal'] = $params['Quantity'] * $params['Price'];
+        if ($partner->payer_nds) {
+            $params['Vat'] = round($params['Price'] * (Yii::$app->params['NDS'] / 100) / (Yii::$app->params['NDS'] / 100 + 1), 2);
+            $params['SubtotalWithVatExcluded'] = $params['Price'] - $params['Vat'];
+        }
+
+        $params['Total'] = [
+            'Total' => $params['Subtotal'],
+            'Vat' => $params['Vat'],
+            'TotalWithVatExcluded' => $params['SubtotalWithVatExcluded'],
+        ];
+
+        self::$params['requestType'] = 'POST';
+
+        $content = (new \yii\base\View())->renderFile(Yii::getAlias('@app') . '/components/proto/xml/UniversalTransferDocument.php', ['data' => $params]);
+        self::$params['postFields'] = $content;
+        self::$response = $this->curlRequest();
+        return self::$response;
+    }
+    public function generateTitleXml($boxId, $ks3id, $executorBoxId)
+    {
+        self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
+            '/GenerateTitleXml',
+            'boxId' => $boxId,
+            'documentTypeNamedId' => 'Invoice', // уникальный строковый идентификатор типа документа
+            'documentFunction' => 'default', // строковый идентификатор функции, уникальный в рамках типа документа
+            'documentVersion' => 'utd820_05_01_01', //  – строковый идентификатор версии, уникальный в рамках функции типа документа
+            'titleIndex' => 0,
+            'EditingSettingId' => '4024c006-6913-487b-bed8-5b18d58e6c77', // Отвечает за редактирование номера и даты для версии utd820_05_01_01 с функцией СЧФ
+            // 'EditingSettingId' => '3c37e4ca-d28e-4dd7-bca4-a667c79e8ede', // Отвечает за редактирование номера и даты для версии utd820_05_01_01 с функцией СЧФ
+        ]);
+        $actKs3 = ActKs3::findOne($ks3id);
+        $contract = $actKs3->contract;
+
+        /** @var \app\models\base\Organization $partner */
+        $partner = $contract->partner;
+        $concatItemName = htmlentities($contract->object_description) .
+            ' по объекту ' . htmlentities($contract->project_text) .
+            ' по договору ' . $contract->number . ' от ' . Yii::$app->formatter->asDate($contract->dt_contract, Yii::$app->params['dateRu']) .
+            ' за период с ' . Yii::$app->formatter->asDate($actKs3->period_from, Yii::$app->params['dateRu']) . ' по ' . Yii::$app->formatter->asDate($actKs3->period_to, Yii::$app->params['dateRu']);
+
+        if (!$partner->diadocPartner || !$partner->diadocPartner->fns_participant_id) {
+            throw new Exception('Идентификатор исполнителя в ФНС не найден');
+        }
+
+        $params = [
+            'DocumentDate' => Yii::$app->formatter->asDate($actKs3->dt_act, Yii::$app->params['dateRu']),
+            'DocumentCreatorBase' => $contract->customer->main_accountant,
+            'DocumentCreator' => $contract->customer->main_accountant,
+            'PaymentDocumentsXml' => null,
+
+            // Продавец (Исполнитель)
+            'executorInn' => $partner->inn,
+            'executorFnsParticipantId' => $partner->diadocPartner->fns_participant_id,
+            'executorOrgName' => 1,
+            'executorType' => $partner->type_id,
+            'executorBoxId' => $executorBoxId,
+
+            // Товар
+            'Product' => $concatItemName,
+            'Unit' => null,
+            'TaxRate' => (($partner->payer_nds) ? Yii::$app->params['NDS'] . '%' : 'без НДС'),
+            'Quantity' => 1,
+            'Price' => 0,
+            'Vat' => 0,
+            'Subtotal' => 0,
+            'SubtotalWithVatExcluded' => 0,
+
+            // Подписант документа СФ (Исполнитель)
+            'customerInn' => $partner->inn,
+            'customerType' => $partner->type_id,
+            'customerLastName' => ' ',
+            'customerFirstName' => ' ',
+            'customerMiddleName' => ' ',
+            'customerBoxId' => $boxId,
+        ];
+        if ($actKs3->lastAct) {
+            $lastActKs2 = $actKs3->lastAct;
+
+            $fioArray = User::ShortNameAsArray($lastActKs2->signee_name_executor);
+            $params['customerLastName'] = $fioArray['last'];
+            $params['customerFirstName'] = $fioArray['first'];
+            $params['customerMiddleName'] = $fioArray['middle'];
+
+            if ($lastActKs2->payment_documents) {
+                $json = Json::decode($lastActKs2->payment_documents);
+                if ($json['ids'] && $json['xml'] ) {
+                    $params['PaymentDocumentsXml'] = $json['xml'];
+                }
+            }
+        }
+
+        foreach ($actKs3->actsKs2 as $key => $item) {
+            /** @var Act $item */
+            if ($item->act_ks3_id == $actKs3->id) {
+                $params['Price'] += $item->summ;
+            }
+
+            // Документы об отгрузке
+            $params['DocumentShipments'][] = [
+                'Name' => 'Акт КС-2',
+                'Number' => ($key == 0) ? ' п/п 1 №' . $item->number : $item->number,
+                'Date' => Yii::$app->formatter->asDate($item->dt_act, Yii::$app->params['dateRu']),
+            ];
+        }
+
+        $params['Subtotal'] = $params['Quantity'] * $params['Price'];
+        if ($partner->payer_nds) {
+            $params['Vat'] = round($params['Price'] * (Yii::$app->params['NDS'] / 100) / (Yii::$app->params['NDS'] / 100 + 1), 2);
+            $params['SubtotalWithVatExcluded'] = $params['Price'] - $params['Vat'];
+        }
+
+        $params['Total'] = [
+            'Total' => $params['Subtotal'],
+            'Vat' => $params['Vat'],
+            'TotalWithVatExcluded' => $params['SubtotalWithVatExcluded'],
+        ];
+        self::$params['requestType'] = 'POST';
+
+        $view = new \yii\base\View();
+
+        /** В расчетах эти параметры участвовали, но после расчетов мы чистим колонки 3,4 шаблона счета фактуры */
+        $params['Price'] = 0;
+        $params['Quantity'] = 0;
+
+        $content = $view->renderFile(Yii::getAlias('@app') . '/components/proto/xml/Invoice.php', ['data' => $params]);
+
+        self::$params['postFields'] = $content;
+
+        self::$response = $this->curlRequest();
+
+        return self::$response;
     }
 
     /** Найти контрагента по параметру */
@@ -253,8 +494,9 @@ class Diadoc extends Component
         if (!$value) {
             die('Не указано значение');
         }
-        foreach ($counterAgents['Counteragent'] as $item) {
-            if ($item->Organization[$key] == $value) {
+        /** @var Counteragent $item */
+        foreach ($counterAgents as $item) {
+            if ($key == 'inn' && $item->getOrganization()->getInn() == $value) {
                 return $item;
             }
         }
@@ -263,16 +505,17 @@ class Diadoc extends Component
 
     /**
      * https://api-docs.diadoc.ru/ru/latest/http/GetMessage.html
-     * @param $boxId
-     * @param $messageId
+     * @param string $boxId
+     * @param string $messageId
      * @return Message|\Protobuf\Message
      */
-    public function getMessage($boxId, $messageId)
+    public function getMessage($boxId, $messageId, $entityId = null)
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
             '/V5/GetMessage',
             'boxId' => $boxId,
             'messageId' => $messageId,
+            'entityId' => $entityId
         ]);
         self::$params['requestType'] = 'GET';
         self::$response = $this->curlRequest();
@@ -282,11 +525,27 @@ class Diadoc extends Component
         return Message::fromStream(self::$response);
     }
 
+    public function getTemplate($boxId, $templateId, $entityId)
+    {
+        self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
+            '/GetTemplate',
+            'boxId' => $boxId,
+            'templateId' => $templateId,
+            'entityId' => $entityId
+        ]);
+        self::$params['requestType'] = 'GET';
+        self::$response = $this->curlRequest();
+        if(self::$errorCode != 200){
+            return self::$error;
+        }
+        return Template::fromStream(self::$response);
+    }
+
     /**
      * https://api-docs.diadoc.ru/ru/latest/http/GetDocument.html
-     * @param $boxId
-     * @param $messageId
-     * @param $entityId
+     * @param string $boxId
+     * @param string $messageId
+     * @param string $entityId
      * @return Document|\Protobuf\Message
      */
     public function getDocument($boxId, $messageId, $entityId)
@@ -298,11 +557,9 @@ class Diadoc extends Component
             'entityId' => $entityId,
         ]);
         self::$params['requestType'] = 'GET';
+        self::$params['requestClass'] = Document::class;
         self::$response = $this->curlRequest();
-        if(self::$errorCode != 200){
-            return self::$error;
-        }
-        return Document::fromStream(self::$response);
+        return self::$response;
     }
 
     public function getOutboundDocuments($boxId)
@@ -329,12 +586,12 @@ class Diadoc extends Component
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
             '/GetMyOrganizations',
-            'outputFormat' => 'xml',
             'autoRegister' => 'false'
         ]);
         self::$params['requestType'] = 'GET';
+        self::$params['requestClass'] = OrganizationList::class;
         self::$response = $this->curlRequest();
-        return $this->response();
+        return self::$response;
     }
 
     /**
@@ -354,7 +611,9 @@ class Diadoc extends Component
 
     public function getHeadOrganization()
     {
-        $items = $this->getMyOrganizationsV2()->getOrganizationsList();
+        /** @var OrganizationList $organizationList */
+        $organizationList = $this->getMyOrganizationsV2();
+        $items = $organizationList->getOrganizationsList();
         if($items->count()) {
             /** @var Organization $item */
             foreach ($items as $item) {
@@ -368,11 +627,11 @@ class Diadoc extends Component
 
     /**
      * https://api-docs.diadoc.ru/ru/latest/http/GetCounteragent.html?#v2
-     * @param $myOrgId
-     * @param $counteragentOrgId
+     * @param string $myOrgId
+     * @param string $counteragentOrgId
      * @return Counteragent|\Protobuf\Message
      */
-    public function getCounteragent($myOrgId, $counteragentOrgId)
+    public function getCounteragent(string $myOrgId, string $counteragentOrgId)
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
             '/V2/GetCounteragent',
@@ -384,10 +643,51 @@ class Diadoc extends Component
         return Counteragent::fromStream(self::$response);
     }
 
+    /** Получение названия документа КС СП */
+    public function getKsPrintFormName($id, $type)
+    {
+        switch (Yii::$app->params['projectCode']) {
+            case 'a001':
+                $printFormController = new A001Controller(Yii::$app->params['projectCode'],
+                    new PrintModule(Yii::$app->params['projectCode']));
+                break;
+            case 'a002':
+                $printFormController = new A002Controller(Yii::$app->params['projectCode'],
+                    new PrintModule(Yii::$app->params['projectCode']));
+                break;
+            default:
+                $printFormController = new A000Controller(Yii::$app->params['projectCode'],
+                    new PrintModule(Yii::$app->params['projectCode']));
+                break;
+        }
+        $method = 'actionPdfks2';
+        $fileTemplate = null;
+        if($type == 2) {
+            $method = 'actionPdfks2';
+            $fileTemplate = Act::FILE_PRINT_FORM_TEMPLATE;
+        }
+        if($type == 3) {
+            $method = 'actionPdfKs3';
+            $fileTemplate = ActKs3::FILE_PRINT_FORM_TEMPLATE;
+        }
+
+        $fileName = str_replace('{ID}', $id, $fileTemplate);
+        $path = Yii::getAlias('@webroot/uploads/protected/KSPrintForms/');
+        if (!file_exists($path . $fileName)) {
+            $printFormController->$method($id, true);
+            echo 'По акту id:' . $id . " не обнаружена печатная форма. ПФ создана принудительно.\n\r";
+        }
+        $content = file_get_contents($path . $fileName);
+        $md5 = md5($content);
+        $fileNameHash = str_replace('.', '_'.$md5.'.', $fileName);
+        file_put_contents($path . $fileNameHash, $content);
+        return $fileName;
+    }
+
     /**
      * https://api-docs.diadoc.ru/ru/latest/http/PostTemplate.html
      * @param array $params
-     * @return mixed|\SimpleXMLElement
+     * @return bool|string
      */
     public function postTemplate($params = [])
     {
@@ -396,19 +696,19 @@ class Diadoc extends Component
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
             '/PostTemplate',
             'operationId' => md5($protoData),
-            // 'outputFormat' => 'xml',
         ]);
         self::$params['requestType'] = 'POST';
+        self::$params['requestClass'] = Template::class;
         self::$params['postFields'] = $protoData;
 
         self::$response = $this->curlRequest();
-        return $this->response();
+        return self::$response;
     }
 
     /**
      * https://api-docs.diadoc.ru/ru/latest/http/PostMessage.html
      * @param array $params
-     * @return \SimpleXMLElement
+     * @return bool|string
      */
     public function postMessage($params = [])
     {
@@ -417,16 +717,13 @@ class Diadoc extends Component
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
             '/V3/PostMessage',
             'operationId' => md5($protoData),
-            // 'outputFormat' => 'xml',
         ]);
         self::$params['requestType'] = 'POST';
+        self::$params['requestClass'] = Message::class;
         self::$params['postFields'] = $protoData;
         self::$params['curlRequestDump'] = 0;
-
         self::$response = $this->curlRequest();
-
-        /** @phpstan-ignore-next-line */
-        return Message::fromStream(self::$response)->getMessageId();
+        return self::$response;
     }
 
     /**
@@ -457,20 +754,30 @@ class Diadoc extends Component
      * Отправка файла на "полку"
      * https://api-docs.diadoc.ru/ru/latest/http/ShelfUpload.html
      * @param string $nameOnShelf
-     * @param string $filePath
      * @return false|string
      */
-    public function shelfUpload($nameOnShelf = 'trolo_name', $filePath = '/var/www/http/web/uploads/protected/KSPrintForms/KS2PrintForm_394.pdf') {
+    public function shelfUpload($nameOnShelf) {
 
+        $path = Yii::getAlias('@webroot' . '/uploads/protected/KSPrintForms/');
+        if(!file_exists($path . $nameOnShelf)) {
+            $this->throwException(\Yii::t('eds', 'Файл не найден'));
+        }
 
-        $url = self::$baseUrl . "/ShelfUpload?nameOnShelf=__userId__/$nameOnShelf&partIndex=0&isLastPart=1";
+        $data = file_get_contents($path . $nameOnShelf);
+        if(!$data) {
+            $this->throwException(\Yii::t('eds', 'Указанный файл пустой'));
+        }
 
-        $data = file_get_contents($filePath);
+        self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
+            '/ShelfUpload',
+            'nameOnShelf' => '__userId__/' . $nameOnShelf,
+            'partIndex' => 0,
+            'isLastPart' => 1,
+        ]);
 
-        $devKey = self::$settings->diadoc_client_id;
-        $token = self::$settings->token;
-        $headers = "Content-type: application/x-www-form-urlencoded\r\nAuthorization: DiadocAuth ddauth_api_client_id=$devKey,ddauth_token=$token";
-
+        /** @var DiadocSetting $settings */
+        $settings = Diadoc::$settings;
+        $headers = "Content-type: application/x-www-form-urlencoded\r\nAuthorization: DiadocAuth ddauth_api_client_id=$settings->diadoc_client_id,ddauth_token=$settings->token";
         $options = [
             'http' => [
                 'header'  => $headers,
@@ -479,36 +786,47 @@ class Diadoc extends Component
             ],
         ];
 
-        $context  = stream_context_create($options);
-        $result = file_get_contents($url, false, $context);
+        return file_get_contents(self::$params['url'], false, stream_context_create($options));
+    }
 
-        return $result;
+    /** Получение документа с "полки" */
+    public function shelfDownload($nameOnShelf) {
+
+        self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
+            '/ShelfDownload',
+            'nameOnShelf' => '__userId__/' . $nameOnShelf,
+        ]);
+
+        self::$params['requestType'] = 'GET';
+
+        self::$params['curlRequestDump'] = 0;
+
+        self::$response = $this->curlRequest();
+
+        return self::$response;
     }
 
     /**
      * Метод возвращает описание типов документов, доступных в ящике
      * https://api-docs.diadoc.ru/ru/latest/http/GetDocumentTypes.html
-     * @return proto\classes\DocumentTypeDescription|\SimpleXMLElement
+     * @return bool|string
      */
-    public function getDocumentTypes()
+    public function getDocumentTypes($boxId)
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
             '/GetDocumentTypes',
-            'boxId' => 'e77319b2f2ff4983b31ea1826a551b75',
-            // 'outputFormat' => 'xml',
-            #'autoRegister' => 'false'
+            'boxId' => $boxId,
         ]);
         self::$params['requestType'] = 'GET';
+        self::$params['requestClass'] = DocumentTypesResponseV2::class;
         self::$response = $this->curlRequest();
-        // todo доделать вывод данных
-        return $documentTypeDescription = \app\components\proto\classes\DocumentTypeDescription::fromStream(self::$response);
-        return $this->response();
+        return self::$response;
     }
 
     /**
      * https://api-docs.diadoc.ru/ru/latest/http/SendDraft.html
      * @param array $params
-     * @return DraftToSend|false|\Protobuf\Message
+     * @return bool|string
      */
     public function sendDraft($params = [])
     {
@@ -517,24 +835,20 @@ class Diadoc extends Component
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
             '/SendDraft',
             'operationId' => md5($protoData),
-            // 'outputFormat' => 'xml',
         ]);
         self::$params['requestType'] = 'POST';
+        self::$params['requestClass'] = DraftToSend::class;
         self::$params['postFields'] = $protoData;
-
         self::$response = $this->curlRequest();
-        if(self::$errorCode != 200) {
-            return false;
-        }
-        return DraftToSend::fromStream(self::$response);
+        return self::$response;
     }
 
     /**
      * https://api-docs.diadoc.ru/ru/latest/http/GetBox.html
-     * @param $boxId
+     * @param string $boxId
      * @return Box|\Protobuf\Message
      */
-    public function getBox($boxId)
+    public function getBox(string $boxId)
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
             '/GetBox',
@@ -548,11 +862,11 @@ class Diadoc extends Component
 
     /**
      * https://api-docs.diadoc.ru/ru/latest/http/GetOrganization.html
-     * @param $key
-     * @param $value
-     * @return Organization|\Protobuf\Message
+     * @param string $key
+     * @param string $value
+     * @return bool|string
      */
-    public function getOrganization($key, $value)
+    public function getOrganization(string $key, string $value)
     {
         self::$params['url'] = self::$externalUrlManager->createAbsoluteUrl([
             '/GetOrganization',
@@ -581,18 +895,6 @@ class Diadoc extends Component
         }
         return null;
     }
-
-    /** Обработка ответа */
-    private function response()
-    {
-        $parser = new XmlParser();
-        return new \SimpleXMLElement(self::$response);
-        if(is_string(self::$response)) {
-            die(self::$response);
-        }
-        return $parser->parse(self::$response, 'Content-Type: application/xml');
-    }
-
 
     private function throwException($error)
     {
@@ -638,17 +940,24 @@ class Diadoc extends Component
             if ($curlInfo['http_code'] == 200 && $json->suggestions) {
                 self::$response = $json->suggestions[0];
             } elseif ($curlInfo['http_code'] != 200) {
+                if (\Yii::$app instanceof Application) {
+                    $userId = \Yii::$app->user->id;
+                } else {
+                    $userId = 0;
+                }
                 self::$error = $response;
                 // Сохранение в логи не корретных ответов сервиса
                 $diaDocLog = new ChangeLog();
-                $diaDocLog->user_id = \Yii::$app->user->id;
+                $diaDocLog->user_id = $userId;
                 $diaDocLog->page = 'Синхронизация данных с сервисом diadoc.ru';
                 $diaDocLog->type_id = ChangeLog::TYPE_DIADOC;
                 $diaDocLog->action_id = ChangeLog::ACTION_DECLINED;
                 $diaDocLog->time = date('Y-m-d H:i:s');
                 $diaDocLog->data_before = serialize((array)$json);
                 $diaDocLog->comment = $response;
-                $diaDocLog->save(false);
+                if (\Yii::$app instanceof Application) {
+                    $diaDocLog->save(false);
+                }
             }
         }
         if(isset(self::$params['curlRequestDump']) && self::$params['curlRequestDump']) {
@@ -656,11 +965,34 @@ class Diadoc extends Component
         }
         curl_close($curl);
         unset(self::$params['postFields']);
-        if(isset(self::$params['requestClass'])) {
+        if(isset(self::$params['requestClass']) && self::$errorCode == 200) {
             $response = self::$params['requestClass']::fromStream($response);
             unset(self::$params['requestClass']);
         }
         return $response;
+    }
+
+    private function getRecipientResponseStatuses()
+    {
+        return [
+            self::RecipientResponseStatus_RecipientResponseStatusUnknown => 'Требуется подписать и отправить',
+            self::RecipientResponseStatus_RecipientResponseStatusNotAcceptable => 'Аннулирован',
+            self::RecipientResponseStatus_WithRecipientSignature => 'Подписан контрагентом',
+            self::RecipientResponseStatus_RecipientSignatureRequestRejected => 'Контрагент отказал в подписи',
+        ];
+    }
+
+    public function getRecipientResponseStatus($statusId)
+    {
+        return $this->getRecipientResponseStatuses()[$statusId];
+    }
+
+    /**
+     * Пока так. Не придумал как очистить Бокс ИД от мусора
+     */
+    public function clearBoxId($boxId) : string
+    {
+        return str_replace('@diadoc.ru', '', $boxId);
     }
 
 }
